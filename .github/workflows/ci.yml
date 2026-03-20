@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        if: ${{ github.actor != 'nektos/act' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Go (act)
+        if: ${{ github.actor == 'nektos/act' }}
+        run: |
+          set -euo pipefail
+          GO_VERSION=1.24.0
+          curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz
+          rm -rf /usr/local/go
+          tar -C /usr/local -xzf /tmp/go.tgz
+          ln -sf /usr/local/go/bin/go /usr/local/bin/go
+          go version
+
+      - name: Run unit tests
+        run: go test ./... -v
+
+  k3s-integration:
+    if: ${{ github.actor != 'nektos/act' }}
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Create k3s cluster
+        run: |
+          k3d cluster create etctd-ci --agents 1 --wait
+          kubectl cluster-info
+
+      - name: Deploy etcd on k3s
+        run: |
+          kubectl apply -f test/k8s/etcd-single.yaml
+          kubectl wait --for=condition=available --timeout=180s deployment/etcd -n etctd-test
+
+      - name: Run integration scenarios against k3s etcd
+        env:
+          ETCTD_SCENARIOS: "1"
+          SMITH_ETCD_ENDPOINTS: "http://127.0.0.1:2379"
+          ETCTD_BIN: /tmp/etctd
+        run: |
+          set -euo pipefail
+
+          go build -o "$ETCTD_BIN" ./cmd/etctd
+
+          kubectl port-forward -n etctd-test svc/etcd 2379:2379 >/tmp/etcd-port-forward.log 2>&1 &
+          PF_PID=$!
+          cleanup() {
+            kill "$PF_PID" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:2379/health >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+
+          curl -fsS http://127.0.0.1:2379/health >/dev/null
+
+          go test ./test/scenarios -v
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -n etctd-test -o wide || true
+          kubectl describe deployment etcd -n etctd-test || true
+          kubectl logs deployment/etcd -n etctd-test || true
+
+      - name: Delete k3s cluster
+        if: always()
+        run: k3d cluster delete etctd-ci || true
+
+  act-local-integration:
+    if: ${{ github.actor == 'nektos/act' }}
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    services:
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.14
+        env:
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
+          ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+          ETCD_INITIAL_ADVERTISE_PEER_URLS: http://127.0.0.1:2380
+          ETCD_INITIAL_CLUSTER: default=http://127.0.0.1:2380
+          ETCD_INITIAL_CLUSTER_STATE: new
+          ETCD_NAME: default
+        ports:
+          - 32379:2379
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        if: ${{ github.actor != 'nektos/act' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Go (act)
+        if: ${{ github.actor == 'nektos/act' }}
+        run: |
+          set -euo pipefail
+          GO_VERSION=1.24.0
+          curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz
+          rm -rf /usr/local/go
+          tar -C /usr/local -xzf /tmp/go.tgz
+          ln -sf /usr/local/go/bin/go /usr/local/bin/go
+          go version
+
+      - name: Wait for etcd service
+        run: |
+          for i in {1..30}; do
+            if curl -fsS "http://127.0.0.1:32379/health" >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "etcd service did not become healthy" >&2
+          exit 1
+
+      - name: Run local scenario tests (act)
+        env:
+          ETCTD_SCENARIOS: "1"
+          SMITH_ETCD_ENDPOINTS: http://127.0.0.1:32379
+          ETCTD_BIN: /tmp/etctd
+        run: |
+          go build -o "$ETCTD_BIN" ./cmd/etctd
+          go test ./test/scenarios -v
